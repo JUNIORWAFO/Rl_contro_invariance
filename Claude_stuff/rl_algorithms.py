@@ -1,1244 +1,634 @@
 """
 rl_algorithms.py
 =================
-Four RL algorithms tailored for LinearUpdateEnv.
+RL agents for LinearUpdateEnv, all sharing one interface:
 
-Each exploits a different aspect of the problem structure:
+    agent.select_action(obs, explore=True) -> np.ndarray
+    agent.push(obs, act, rew, next_obs, done)
+    agent.update() -> dict   (training metrics, empty dict if not ready)
 
-  1. ModelBasedRL   — Uses known A, B to do gradient-based policy optimization
-                      directly through the dynamics. Zero model learning needed.
-                      Most sample-efficient possible for this env.
+Agents
+------
+  RandomAgent        — uniform random baseline
+  CEMAgent           — Cross-Entropy Method (model-free, gradient-free)
+  DDPGAgent          — Deep Deterministic Policy Gradient
+  TD3Agent           — Twin Delayed DDPG
+  SACAgent           — Soft Actor-Critic (entropy-regularised)
+  ModelBasedAgent    — learned linear model + LQR/MPC planning
+  SACxCEMAgent       — CEM explores, SAC exploits (hybrid)
 
-  2. SAC            — Soft Actor-Critic with automatic entropy tuning.
-                      Off-policy → reuses every transition, great for sparse rewards.
-                      Pairs naturally with HER buffer for hull relabeling.
+All gradient-based agents optionally accept a HullDistanceModule for
+potential-based reward shaping (plug in after hull is identified).
 
-  3. CEM / ES       — Cross-Entropy Method + Evolution Strategies.
-                      Gradient-free → robust to reward discontinuities (hull boundary).
-                      Parallelizable, no neural net required.
-
-  4. MPC-RL Hybrid  — Model Predictive Control uses A, B to plan H steps ahead.
-                      RL value function corrects for finite horizon bias.
-                      Best of both: planning precision + learned long-horizon value.
-
-All algorithms share:
-  - Same LinearUpdateEnv interface (step returns 5 values)
-  - Compatible with any HullMonitor for reward relabeling
-  - EpisodeRecord output for post-episode hull processing
-
-Usage:
-    env     = LinearUpdateEnv(A, B, ...)
-    monitor = PostEpisodeHullMonitor(...)
-
-    # Pick any algorithm:
-    agent = ModelBasedRL(A, B, env.observation_space, env.action_space)
-    agent = SACAgent(env.observation_space, env.action_space)
-    agent = CEMAgent(env.observation_space, env.action_space)
-    agent = MPCRLAgent(A, B, env.observation_space, env.action_space)
-
-    # Unified training loop:
-    train(env, agent, monitor, total_steps=500_000)
+Shared utilities
+----------------
+  ReplayBuffer       — uniform experience replay
+  make_agent(name, env) — factory used by benchmark.py
 """
-
 from __future__ import annotations
 
 import copy
-import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
-
+from typing import Dict, List, Optional, Tuple
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions import Normal
 
 try:
-    from hull_monitors import EpisodeRecord, HullResult, PostEpisodeHullMonitor
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import torch.optim as optim
+    _TORCH = True
 except ImportError:
-    @dataclass
-    class EpisodeRecord:
-        states: np.ndarray; actions: np.ndarray
-        rewards: np.ndarray; ep_id: int = 0
-        @property
-        def T(self): return len(self.actions)
-
-    @dataclass
-    class HullResult:
-        in_hull_mask: np.ndarray; first_hull_step: Optional[int]
-        is_valid_target: bool; source: str = "unknown"
-        @property
-        def hull_reached(self): return self.first_hull_step is not None
-        def relabel_rewards(self, r, hr):
-            out = r.copy(); out[self.in_hull_mask] = hr; return out
+    _TORCH = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SHARED UTILITIES
+#  REPLAY BUFFER
 # ══════════════════════════════════════════════════════════════════════════════
-
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    """Polyak averaging: target ← τ·source + (1-τ)·target"""
-    for t, s in zip(target.parameters(), source.parameters()):
-        t.data.copy_(tau * s.data + (1.0 - tau) * t.data)
-
-
-def hard_update(target: nn.Module, source: nn.Module):
-    target.load_state_dict(source.state_dict())
-
 
 class ReplayBuffer:
-    """
-    Off-policy replay buffer supporting:
-      - Standard (s, a, r, s', done) transitions
-      - HER relabeling via .relabel_last_episode()
-    """
-
-    def __init__(self, capacity: int, obs_dim: int, act_dim: int,
-                 device: torch.device):
-        self.capacity = capacity
-        self.device   = device
+    def __init__(self, capacity: int = 100_000, xDim: int = 4, uDim: int = 2):
+        self.cap = capacity
+        self.xDim = xDim; self.uDim = uDim
+        self.s  = np.zeros((capacity, xDim), np.float32)
+        self.a  = np.zeros((capacity, uDim), np.float32)
+        self.r  = np.zeros(capacity,          np.float32)
+        self.ns = np.zeros((capacity, xDim), np.float32)
+        self.d  = np.zeros(capacity,          np.float32)
         self.ptr = self.size = 0
 
-        self.obs     = np.zeros((capacity, obs_dim),  dtype=np.float32)
-        self.actions = np.zeros((capacity, act_dim),  dtype=np.float32)
-        self.rewards = np.zeros((capacity, 1),         dtype=np.float32)
-        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
-        self.dones   = np.zeros((capacity, 1),         dtype=np.float32)
+    def push(self, s, a, r, ns, done):
+        i = self.ptr
+        self.s[i]=s; self.a[i]=a; self.r[i]=r; self.ns[i]=ns; self.d[i]=float(done)
+        self.ptr  = (i+1) % self.cap
+        self.size = min(self.size+1, self.cap)
 
-        # Track episode boundaries for HER
-        self._ep_start = 0
-        self._ep_boundaries: List[Tuple[int, int]] = []
-
-    def push(self, obs, action, reward, next_obs, done):
-        self.obs[self.ptr]      = obs
-        self.actions[self.ptr]  = action
-        self.rewards[self.ptr]  = reward
-        self.next_obs[self.ptr] = next_obs
-        self.dones[self.ptr]    = done
-        if done:
-            self._ep_boundaries.append((self._ep_start, self.ptr))
-            self._ep_start = (self.ptr + 1) % self.capacity
-        self.ptr  = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def relabel_last_episode(self, result: HullResult, hull_reward: float):
-        """Retroactively overwrite rewards for the most recent episode."""
-        if not self._ep_boundaries:
-            return
-        start, end = self._ep_boundaries[-1]
-        ep_len = (end - start) % self.capacity + 1
-        if len(result.in_hull_mask) < ep_len:
-            return
-        for i, flag in enumerate(result.in_hull_mask[:ep_len]):
-            if flag:
-                idx = (start + i) % self.capacity
-                self.rewards[idx] = hull_reward
-
-    def sample(self, batch_size: int):
-        idx   = np.random.randint(0, self.size, size=batch_size)
-        def t(x): return torch.tensor(x[idx], device=self.device)
-        return t(self.obs), t(self.actions), t(self.rewards), \
-               t(self.next_obs), t(self.dones)
+    def sample(self, batch: int) -> Tuple:
+        idx = np.random.randint(0, self.size, batch)
+        return (self.s[idx], self.a[idx], self.r[idx],
+                self.ns[idx], self.d[idx])
 
     def __len__(self): return self.size
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  1.  MODEL-BASED RL
-#  Exploit known A, B — gradient directly through dynamics
+#  RANDOM AGENT  (baseline)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class LinearPolicy(nn.Module):
-    """
-    Deterministic policy: u = K·x  (linear feedback gain).
-    This is the optimal structure for LQR-like problems.
-    Extended with a nonlinear correction for hull-seeking behavior.
-    """
-
-    def __init__(self, obs_dim: int, act_dim: int,
-                 hidden: int = 64, nonlinear: bool = True):
-        super().__init__()
-        self.linear = nn.Linear(obs_dim, act_dim, bias=False)  # K matrix
-
-        self.nonlinear_head = None
-        if nonlinear:
-            self.nonlinear_head = nn.Sequential(
-                nn.Linear(obs_dim, hidden), nn.Tanh(),
-                nn.Linear(hidden, act_dim),
-            )
-            nn.init.zeros_(self.nonlinear_head[-1].weight)
-            nn.init.zeros_(self.nonlinear_head[-1].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = self.linear(x)
-        if self.nonlinear_head is not None:
-            u = u + self.nonlinear_head(x)
-        return u
-
-
-class ModelBasedRL:
-    """
-    Model-Based Policy Optimization using known linear dynamics.
-
-    Key idea: since A and B are known, we can unroll the dynamics for H steps
-    and backpropagate the reward gradient directly through them into the policy.
-    No value function needed. No replay buffer needed.
-
-    Objective (differentiable through dynamics):
-        max_π  Σ_{t=0}^{H} γ^t · r(x_t, u_t)
-        s.t.   x_{t+1} = A·x_t + B·π(x_t)
-
-    This is essentially shooting-based optimal control with a learned policy
-    as the parametric decision variable.
-
-    Sample efficiency: extremely high — each env step generates a full
-    H-step gradient signal through the differentiable model rollout.
-    """
-
-    def __init__(
-        self,
-        A:            np.ndarray,
-        B:            np.ndarray,
-        obs_space,
-        act_space,
-        horizon:      int   = 20,        # differentiable rollout length
-        gamma:        float = 0.99,
-        lr:           float = 3e-4,
-        hidden:       int   = 64,
-        hull_reward:  float = 100.0,
-        boundary_pen: float = -100.0,
-        device:       str   = "cpu",
-    ):
-        self.device = torch.device(device)
-        self.H      = horizon
-        self.gamma  = gamma
-
-        self.A = torch.tensor(A, dtype=torch.float32, device=self.device)
-        self.B = torch.tensor(B, dtype=torch.float32, device=self.device)
-
-        obs_dim = obs_space.shape[0]
-        act_dim = act_space.shape[0]
-        self.act_low  = torch.tensor(act_space.low,  device=self.device)
-        self.act_high = torch.tensor(act_space.high, device=self.device)
-        self.obs_low  = torch.tensor(obs_space.low,  device=self.device)
-        self.obs_high = torch.tensor(obs_space.high, device=self.device)
-
-        self.policy    = LinearPolicy(obs_dim, act_dim, hidden).to(self.device)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
-
-        self.hull_reward  = hull_reward
-        self.boundary_pen = boundary_pen
-
-        # Hull center tracked from monitor (updated externally)
-        self.hull_center: Optional[torch.Tensor] = None
-
-    def select_action(self, obs: np.ndarray) -> np.ndarray:
-        with torch.no_grad():
-            x   = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            u   = self.policy(x)
-            u   = torch.clamp(u, self.act_low, self.act_high)
-        return u.cpu().numpy()
-
-    def update(self, obs_batch: np.ndarray) -> dict:
-        """
-        Differentiable model rollout from a batch of starting states.
-        Backprop reward gradient through H-step unrolled dynamics.
-        """
-        B_sz = obs_batch.shape[0]
-        x    = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
-
-        total_reward = torch.zeros(B_sz, device=self.device)
-        discount     = 1.0
-
-        for _ in range(self.H):
-            u     = self.policy(x)
-            u     = torch.clamp(u, self.act_low, self.act_high)
-
-            x_next = (self.A @ x.unsqueeze(-1) + self.B @ u.unsqueeze(-1)).squeeze(-1)
-
-            # Differentiable reward signal
-            reward = self._diff_reward(x, x_next)
-            total_reward = total_reward + discount * reward
-            discount    *= self.gamma
-            x            = x_next
-
-        loss = -total_reward.mean()
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-        self.optimizer.step()
-        return {"loss": loss.item(), "mean_reward": total_reward.mean().item()}
-
-    def _diff_reward(self, x: torch.Tensor,
-                     x_next: torch.Tensor) -> torch.Tensor:
-        """
-        Differentiable reward proxy:
-          - Boundary penalty: soft sigmoid penalizes states near/outside bounds
-          - Hull reward: if hull center known, reward proximity to it
-        """
-        # Soft boundary penalty (differentiable approximation)
-        margin   = torch.min(
-            x_next - self.obs_low, self.obs_high - x_next
-        ).min(dim=-1).values
-        boundary = torch.sigmoid(margin * 5.0) * 2.0 - 1.0   # in (-1, 1)
-
-        if self.hull_center is not None:
-            dist   = torch.norm(x_next - self.hull_center, dim=-1)
-            reward = -0.1 * dist + boundary * 10.0
-        else:
-            # Before hull is known: encourage exploration (maximize state spread)
-            reward = boundary * 0.1
-
-        return reward
-
-    def set_hull_center(self, center: np.ndarray):
-        self.hull_center = torch.tensor(
-            center, dtype=torch.float32, device=self.device)
+class RandomAgent:
+    name = "random"
+    def __init__(self, env): self.env = env
+    def select_action(self, obs, explore=True): return self.env.action_space.sample()
+    def push(self, *args): pass
+    def update(self): return {}
+    def set_hull_module(self, m): pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  2.  SAC  — Soft Actor-Critic
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MLP(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden=256, n_layers=2, activate_last=False):
-        super().__init__()
-        dims   = [in_dim] + [hidden] * n_layers + [out_dim]
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i+1]))
-            if i < len(dims) - 2 or activate_last:
-                layers.append(nn.ReLU())
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x): return self.net(x)
-
-
-class SACActor(nn.Module):
-    """
-    Stochastic actor: outputs (μ, log_σ) → reparameterized Normal.
-    Actions squashed through tanh to respect bounds.
-    """
-    LOG_STD_MIN = -5
-    LOG_STD_MAX = 2
-
-    def __init__(self, obs_dim, act_dim, hidden=256, act_scale=1.0):
-        super().__init__()
-        self.net     = MLP(obs_dim, hidden, hidden, activate_last=True)
-        self.mu_head = nn.Linear(hidden, act_dim)
-        self.ls_head = nn.Linear(hidden, act_dim)
-        self.act_scale = act_scale
-
-    def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
-        h      = self.net(x)
-        mu     = self.mu_head(h)
-        log_std = self.ls_head(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
-        return mu, log_std
-
-    def sample(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (action, log_prob) with reparameterization + tanh squashing."""
-        mu, log_std = self(x)
-        std         = log_std.exp()
-        eps         = torch.randn_like(mu)
-        u           = mu + eps * std                          # pre-squash
-
-        # Tanh squash
-        action      = torch.tanh(u) * self.act_scale
-
-        # Log prob with tanh correction
-        log_prob    = Normal(mu, std).log_prob(u).sum(-1, keepdim=True)
-        log_prob   -= (2 * (np.log(2) - u - F.softplus(-2 * u))).sum(-1, keepdim=True)
-        return action, log_prob
-
-
-class SACCritic(nn.Module):
-    """Twin Q-networks for clipped double-Q learning."""
-
-    def __init__(self, obs_dim, act_dim, hidden=256):
-        super().__init__()
-        self.q1 = MLP(obs_dim + act_dim, 1, hidden)
-        self.q2 = MLP(obs_dim + act_dim, 1, hidden)
-
-    def forward(self, obs, act):
-        x  = torch.cat([obs, act], dim=-1)
-        return self.q1(x), self.q2(x)
-
-    def min_q(self, obs, act):
-        q1, q2 = self(obs, act)
-        return torch.min(q1, q2)
-
-
-class SACAgent:
-    """
-    Soft Actor-Critic for continuous action spaces.
-
-    Why SAC for your problem:
-      - Off-policy → high sample efficiency via replay buffer
-      - Maximum entropy → natural exploration, resists premature convergence
-        to suboptimal hull (important when hull reward is non-stationary)
-      - Automatic entropy tuning → no manual temperature tuning
-      - Pairs perfectly with HER relabeling (buffer is reusable)
-
-    Hull reward is injected via buffer.relabel_last_episode() after
-    each episode, so SAC never sees the raw environment rewards for
-    hull-hit steps — only the relabeled ones.
-    """
-
-    def __init__(
-        self,
-        obs_space,
-        act_space,
-        hidden:        int   = 256,
-        lr:            float = 3e-4,
-        gamma:         float = 0.99,
-        tau:           float = 0.005,
-        alpha:         float = 0.2,      # initial entropy coefficient
-        auto_alpha:    bool  = True,     # automatic entropy tuning
-        buffer_size:   int   = 1_000_000,
-        batch_size:    int   = 256,
-        warmup_steps:  int   = 1000,     # random actions before training
-        update_every:  int   = 1,
-        device:        str   = "cpu",
-    ):
-        self.device       = torch.device(device)
-        self.gamma        = gamma
-        self.tau          = tau
-        self.batch_size   = batch_size
-        self.warmup_steps = warmup_steps
-        self.update_every = update_every
-
-        obs_dim  = obs_space.shape[0]
-        act_dim  = act_space.shape[0]
-
-        # Action scaling (tanh outputs [-1,1], scale to actual bounds)
-        act_scale  = float((act_space.high - act_space.low).max() / 2.0)
-        self.act_bias  = torch.tensor(
-            (act_space.high + act_space.low) / 2.0,
-            dtype=torch.float32, device=self.device)
-        self.act_scale = act_scale
-
-        # Networks
-        self.actor        = SACActor(obs_dim, act_dim, hidden, act_scale).to(self.device)
-        self.critic       = SACCritic(obs_dim, act_dim, hidden).to(self.device)
-        self.critic_target = copy.deepcopy(self.critic)
-        hard_update(self.critic_target, self.critic)
-
-        # Optimizers
-        self.actor_opt   = optim.Adam(self.actor.parameters(),  lr=lr)
-        self.critic_opt  = optim.Adam(self.critic.parameters(), lr=lr)
-
-        # Automatic entropy tuning
-        self.auto_alpha  = auto_alpha
-        if auto_alpha:
-            self.target_entropy = -act_dim          # heuristic: -|A|
-            self.log_alpha      = torch.tensor(
-                np.log(alpha), requires_grad=True,
-                device=self.device, dtype=torch.float32)
-            self.alpha_opt = optim.Adam([self.log_alpha], lr=lr)
-            self.alpha     = self.log_alpha.exp().item()
-        else:
-            self.alpha = alpha
-
-        self.buffer   = ReplayBuffer(buffer_size, obs_dim, act_dim, self.device)
-        self._steps   = 0
-        self.metrics: Dict[str, float] = {}
-
-    def select_action(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        with torch.no_grad():
-            x = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-            if deterministic or self._steps < self.warmup_steps:
-                if self._steps < self.warmup_steps:
-                    # Random warmup
-                    return np.random.uniform(-self.act_scale, self.act_scale,
-                                             size=(self.actor.mu_head.out_features,))
-                mu, _ = self.actor(x)
-                return (torch.tanh(mu) * self.act_scale + self.act_bias).squeeze().cpu().numpy()
-            action, _ = self.actor.sample(x)
-            return (action + self.act_bias).squeeze().cpu().numpy()
-
-    def push(self, obs, action, reward, next_obs, done):
-        self.buffer.push(obs, action, reward, next_obs, done)
-        self._steps += 1
-
-    def update(self) -> dict:
-        if len(self.buffer) < self.batch_size or self._steps < self.warmup_steps:
-            return {}
-        if self._steps % self.update_every != 0:
-            return {}
-
-        obs, acts, rews, next_obs, dones = self.buffer.sample(self.batch_size)
-
-        # ── Critic update ─────────────────────────────────────────────────────
-        with torch.no_grad():
-            next_act, next_lp = self.actor.sample(next_obs)
-            next_q  = self.critic_target.min_q(next_obs, next_act)
-            target_q = rews + (1 - dones) * self.gamma * (next_q - self.alpha * next_lp)
-
-        q1, q2    = self.critic(obs, acts)
-        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_opt.step()
-
-        # ── Actor update ──────────────────────────────────────────────────────
-        new_act, log_pi = self.actor.sample(obs)
-        q_pi            = self.critic.min_q(obs, new_act)
-        actor_loss      = (self.alpha * log_pi - q_pi).mean()
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-        self.actor_opt.step()
-
-        # ── Alpha update ──────────────────────────────────────────────────────
-        alpha_loss = torch.tensor(0.0)
-        if self.auto_alpha:
-            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-            self.alpha_opt.zero_grad()
-            alpha_loss.backward()
-            self.alpha_opt.step()
-            self.alpha = self.log_alpha.exp().item()
-
-        # Polyak update target
-        soft_update(self.critic_target, self.critic, self.tau)
-
-        self.metrics = {
-            "critic_loss": critic_loss.item(),
-            "actor_loss":  actor_loss.item(),
-            "alpha":       self.alpha,
-            "alpha_loss":  alpha_loss.item(),
-        }
-        return self.metrics
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  3.  CEM + NATURAL EVOLUTION STRATEGY
+#  CEM AGENT  (gradient-free, good for short horizons)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CEMAgent:
     """
-    Cross-Entropy Method for policy optimization.
+    Cross-Entropy Method with linear policy  u = K x + b.
 
-    Treats the policy as a multivariate Gaussian over parameters θ.
-    Each generation: sample N policies, evaluate, keep top-k elite,
-    fit new Gaussian to elites.
-
-    Why CEM for this problem:
-      - Gradient-free: robust to discontinuous hull-boundary rewards
-      - Naturally parallelizable: N policy evaluations are independent
-      - No hyperparameter sensitivity (no learning rate instability)
-      - Works well when reward landscape has multiple modes (multiple valid hulls)
-
-    The policy is a linear+bias map: u = Kx + b
-    This keeps the parameter space small and well-conditioned.
+    Maintains a Gaussian distribution over (K, b) parameters.
+    Each update: sample N policies, evaluate top-k, refit Gaussian.
+    Elite fraction determines selection pressure.
     """
-
-    def __init__(
-        self,
-        obs_space,
-        act_space,
-        population_size: int   = 64,
-        elite_frac:      float = 0.2,
-        noise_std_init:  float = 0.5,
-        noise_std_min:   float = 0.01,
-        noise_decay:     float = 0.995,
-        n_eval_steps:    int   = 200,     # steps per policy evaluation
-        gamma:           float = 0.99,
-        extra_noise:     float = 0.1,     # extra noise injected to avoid collapse
-    ):
-        self.obs_dim    = obs_space.shape[0]
-        self.act_dim    = act_space.shape[0]
-        self.act_low    = act_space.low
-        self.act_high   = act_space.high
-
-        self.N          = population_size
-        self.n_elite    = max(1, int(population_size * elite_frac))
-        self.noise_std  = noise_std_init
-        self.noise_min  = noise_std_min
-        self.noise_decay = noise_decay
-        self.n_eval     = n_eval_steps
-        self.gamma      = gamma
-        self.extra_noise = extra_noise
-
-        # Policy: u = W·x + b  (linear policy)
-        self.param_dim  = self.obs_dim * self.act_dim + self.act_dim
-        self.theta_mean = np.zeros(self.param_dim, dtype=np.float32)
-        self.theta_std  = np.ones(self.param_dim, dtype=np.float32) * noise_std_init
-
-        self._best_theta = self.theta_mean.copy()
-        self._best_score = -np.inf
-        self.generation  = 0
-        self.metrics: Dict[str, float] = {}
-
-    def _theta_to_policy(self, theta: np.ndarray):
-        """Unpack flat parameter vector into (W, b)."""
-        W = theta[:self.obs_dim * self.act_dim].reshape(self.act_dim, self.obs_dim)
-        b = theta[self.obs_dim * self.act_dim:]
-        return W, b
-
-    def _policy_action(self, theta: np.ndarray, obs: np.ndarray) -> np.ndarray:
-        W, b = self._theta_to_policy(theta)
-        u    = W @ obs + b
-        return np.clip(u, self.act_low, self.act_high)
-
-    def select_action(self, obs: np.ndarray) -> np.ndarray:
-        """Use current best policy (mean of distribution)."""
-        return self._policy_action(self._best_theta, obs)
-
-    def evolve(self, env_factory, hull_reward: float = 100.0,
-               monitor=None) -> dict:
-        """
-        Run one generation of CEM:
-          1. Sample N parameter vectors from current distribution
-          2. Evaluate each in a fresh env copy
-          3. Keep top-k elites, update distribution
-        """
-        # Sample population
-        population = self.theta_mean + \
-            np.random.randn(self.N, self.param_dim).astype(np.float32) * self.theta_std
-
-        scores    = np.zeros(self.N)
-        ep_records = []
-
-        for i, theta in enumerate(population):
-            env = env_factory()
-            obs, _ = env.reset()
-            states  = [obs.copy()]
-            actions = []
-            rewards = []
-
-            for _ in range(self.n_eval):
-                act = self._policy_action(theta, obs)
-                obs, r, term, trunc, _ = env.step(act)
-                states.append(obs.copy()); actions.append(act.copy())
-                rewards.append(r)
-                if term or trunc: break
-
-            # Post-episode hull check
-            record = EpisodeRecord(
-                states  = np.array(states,  dtype=np.float32),
-                actions = np.array(actions, dtype=np.float32),
-                rewards = np.array(rewards, dtype=np.float32),
-                ep_id   = self.generation * self.N + i,
-            )
-            if monitor is not None:
-                result  = monitor.process(record)
-                rewards = result.relabel_rewards(np.array(rewards), hull_reward)
-
-            # Discounted return
-            G = 0.0
-            for r in reversed(rewards):
-                G = r + self.gamma * G
-            scores[i]  = G
-            ep_records.append(record)
-
-        # Select elites
-        elite_idx  = np.argsort(scores)[-self.n_elite:]
-        elites     = population[elite_idx]
-        best_idx   = elite_idx[-1]
-
-        if scores[best_idx] > self._best_score:
-            self._best_score = scores[best_idx]
-            self._best_theta = population[best_idx].copy()
-
-        # Update distribution — fit Gaussian to elites + extra noise
-        self.theta_mean = elites.mean(axis=0)
-        self.theta_std  = elites.std(axis=0) + self.extra_noise
-        self.theta_std  = np.maximum(self.theta_std, self.noise_min)
-        self.noise_std  = max(self.noise_std * self.noise_decay, self.noise_min)
-
-        self.generation += 1
-        self.metrics = {
-            "best_score":  float(self._best_score),
-            "mean_score":  float(scores.mean()),
-            "elite_mean":  float(scores[elite_idx].mean()),
-            "noise_std":   float(self.noise_std),
-            "generation":  self.generation,
-        }
-        return self.metrics, ep_records
-
-
-class NESAgent:
-    """
-    Natural Evolution Strategy — gradient-based but gradient-free wrt env.
-
-    Unlike CEM (which fits a distribution to elites), NES estimates the
-    gradient of E[F(θ)] using the log-derivative trick:
-        ∇_μ E[F] = E[(F(θ) - b) · ∇_μ log p(θ|μ)]
-                 = (1/N·σ) Σ_i F_i · ε_i    (antithetic sampling)
-
-    where b is a baseline (mean fitness), σ is the noise scale.
-    This gives a natural policy gradient without differentiating through env.
-
-    Antithetic sampling: evaluate θ+ε and θ-ε in pairs to reduce variance.
-    """
-
-    def __init__(
-        self,
-        obs_space,
-        act_space,
-        population_size: int   = 50,
-        sigma:           float = 0.1,
-        lr:              float = 0.01,
-        n_eval_steps:    int   = 200,
-        gamma:           float = 0.99,
-        lr_decay:        float = 0.999,
-    ):
-        self.obs_dim = obs_space.shape[0]
-        self.act_dim = act_space.shape[0]
-        self.act_low = act_space.low; self.act_high = act_space.high
-
-        assert population_size % 2 == 0, "NES needs even population for antithetic pairs"
-        self.N        = population_size
-        self.sigma    = sigma
-        self.lr       = lr
-        self.n_eval   = n_eval_steps
-        self.gamma    = gamma
-        self.lr_decay = lr_decay
-
-        self.param_dim   = self.obs_dim * self.act_dim + self.act_dim
-        self.theta       = np.zeros(self.param_dim, dtype=np.float32)
-        self.generation  = 0
-        self.metrics: Dict[str, float] = {}
-
-    def _policy_action(self, theta, obs):
-        W = theta[:self.obs_dim * self.act_dim].reshape(self.act_dim, self.obs_dim)
-        b = theta[self.obs_dim * self.act_dim:]
-        return np.clip(W @ obs + b, self.act_low, self.act_high)
-
-    def select_action(self, obs: np.ndarray) -> np.ndarray:
-        return self._policy_action(self.theta, obs)
-
-    def _evaluate(self, theta, env_factory, monitor=None,
-                  hull_reward=100.0) -> Tuple[float, EpisodeRecord]:
-        env   = env_factory()
-        obs, _= env.reset()
-        states, actions, rewards = [obs.copy()], [], []
-
-        for _ in range(self.n_eval):
-            act = self._policy_action(theta, obs)
-            obs, r, term, trunc, _ = env.step(act)
-            states.append(obs.copy()); actions.append(act.copy()); rewards.append(r)
-            if term or trunc: break
-
-        record = EpisodeRecord(
-            states  = np.array(states,  dtype=np.float32),
-            actions = np.array(actions, dtype=np.float32),
-            rewards = np.array(rewards, dtype=np.float32),
-        )
-        if monitor is not None:
-            result  = monitor.process(record)
-            rewards = list(result.relabel_rewards(np.array(rewards), hull_reward))
-
-        G = sum(r * self.gamma**t for t, r in enumerate(rewards))
-        return float(G), record
-
-    def evolve(self, env_factory, hull_reward=100.0, monitor=None) -> dict:
-        """
-        One NES generation using antithetic sampling.
-        """
-        half  = self.N // 2
-        noise = np.random.randn(half, self.param_dim).astype(np.float32)
-
-        scores     = np.zeros(self.N, dtype=np.float32)
-        ep_records = []
-
-        for i in range(half):
-            f_pos, r_pos = self._evaluate(
-                self.theta + self.sigma * noise[i], env_factory, monitor, hull_reward)
-            f_neg, r_neg = self._evaluate(
-                self.theta - self.sigma * noise[i], env_factory, monitor, hull_reward)
-            scores[i]        = f_pos
-            scores[half + i] = f_neg
-            ep_records.extend([r_pos, r_neg])
-
-        # Rank-normalize fitness for stable gradient
-        ranks         = np.argsort(np.argsort(scores)).astype(np.float32)
-        ranks         = (ranks / (self.N - 1)) - 0.5   # in [-0.5, 0.5]
-
-        # NES gradient: weighted sum of noise directions
-        gradient = np.zeros_like(self.theta)
-        for i in range(half):
-            gradient += (ranks[i] - ranks[half + i]) * noise[i]
-        gradient /= (self.N * self.sigma)
-
-        # Gradient ascent
-        self.theta  += self.lr * gradient
-        self.lr     *= self.lr_decay
-        self.generation += 1
-
-        self.metrics = {
-            "best_score":  float(scores.max()),
-            "mean_score":  float(scores.mean()),
-            "gradient_norm": float(np.linalg.norm(gradient)),
-            "lr":          self.lr,
-            "generation":  self.generation,
-        }
-        return self.metrics, ep_records
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  4.  MPC-RL HYBRID
-#  Model Predictive Control + learned value function tail correction
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ValueNetwork(nn.Module):
-    """Learned value function V(s) to correct finite-horizon MPC bias."""
-
-    def __init__(self, obs_dim: int, hidden: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden),  nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x): return self.net(x).squeeze(-1)
-
-
-class MPCRLAgent:
-    """
-    Model Predictive Control with learned value function tail.
-
-    Action selection at each step t:
-      1. MPC: plan H-step sequence {u_0..u_{H-1}} to maximize
-              Σ_{k=0}^{H-1} γ^k r_k + γ^H V(x_H)
-              using the known dynamics x_{k+1} = Ax_k + Bu_k
-      2. Execute only u_0 (receding horizon)
-      3. RL: learn V(s) from observed returns (TD or MC)
-
-    Why this combination is powerful:
-      - MPC handles short-horizon precision (exact dynamics + planning)
-      - V(s) handles long-horizon credit assignment (what MPC can't see)
-      - Hull reward shapes V(s) naturally: V(s) ≈ hull_reward for s near hull
-      - No policy network needed — actions come directly from optimization
-
-    Optimization: Random Shooting (sample M random sequences, pick best)
-    Can be upgraded to CEM-MPC for higher quality at more compute.
-    """
-
-    def __init__(
-        self,
-        A:              np.ndarray,
-        B:              np.ndarray,
-        obs_space,
-        act_space,
-        horizon:        int   = 15,
-        n_samples:      int   = 512,      # random shooting candidates
-        gamma:          float = 0.99,
-        value_lr:       float = 3e-4,
-        value_hidden:   int   = 128,
-        value_update_every: int = 10,
-        buffer_size:    int   = 100_000,
-        batch_size:     int   = 256,
-        warmup_steps:   int   = 500,
-        device:         str   = "cpu",
-        # MPC-CEM refinement (optional)
-        cem_iters:      int   = 3,        # CEM refinement iterations (0 = pure random shooting)
-        cem_elite_frac: float = 0.1,
-    ):
-        self.device     = torch.device(device)
-        self.H          = horizon
-        self.M          = n_samples
-        self.gamma      = gamma
-        self.cem_iters  = cem_iters
-        self.cem_elite  = max(1, int(n_samples * cem_elite_frac))
-
-        self.A = torch.tensor(A, dtype=torch.float32, device=self.device)
-        self.B = torch.tensor(B, dtype=torch.float32, device=self.device)
-
-        obs_dim  = obs_space.shape[0]
-        act_dim  = act_space.shape[0]
-        self.act_low  = torch.tensor(act_space.low,  dtype=torch.float32, device=self.device)
-        self.act_high = torch.tensor(act_space.high, dtype=torch.float32, device=self.device)
-        self.obs_low  = torch.tensor(obs_space.low,  dtype=torch.float32, device=self.device)
-        self.obs_high = torch.tensor(obs_space.high, dtype=torch.float32, device=self.device)
-        self.obs_dim  = obs_dim
-        self.act_dim  = act_dim
-
-        # Value function
-        self.value      = ValueNetwork(obs_dim, value_hidden).to(self.device)
-        self.value_target = copy.deepcopy(self.value)
-        self.value_opt  = optim.Adam(self.value.parameters(), lr=value_lr)
-
-        # Transition replay buffer for value learning
-        self.buffer     = ReplayBuffer(buffer_size, obs_dim, act_dim, self.device)
-        self.batch_size = batch_size
-        self.warmup     = warmup_steps
-        self.update_every = value_update_every
-
-        self._steps     = 0
-        self.metrics: Dict[str, float] = {}
-
-        # Hull reward shaping target (set externally from monitor)
-        self.hull_center: Optional[torch.Tensor] = None
-        self.hull_target: Optional[torch.Tensor] = None
-
-    def select_action(self, obs: np.ndarray) -> np.ndarray:
-        """MPC action selection via random shooting + CEM refinement."""
-        with torch.no_grad():
-            x0 = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            u0 = self._mpc_plan(x0)
-        return u0.cpu().numpy()
-
-    def _mpc_plan(self, x0: torch.Tensor) -> torch.Tensor:
-        """
-        Plan H-step action sequence using random shooting.
-        Optionally refine with CEM iterations.
-        Returns the first action of the best sequence.
-        """
-        # Initial random candidates: (M, H, act_dim)
-        u_mean = torch.zeros(self.H, self.act_dim, device=self.device)
-        u_std  = torch.ones( self.H, self.act_dim, device=self.device)
-
-        for cem_it in range(max(1, self.cem_iters)):
-            # Sample action sequences
-            eps    = torch.randn(self.M, self.H, self.act_dim, device=self.device)
-            U      = (u_mean.unsqueeze(0) + u_std.unsqueeze(0) * eps)
-            U      = U.clamp(self.act_low, self.act_high)        # (M, H, act_dim)
-
-            # Roll out dynamics for all M sequences in parallel
-            returns = self._rollout_returns(x0, U)               # (M,)
-
-            if self.cem_iters > 0:
-                # CEM: update distribution from elites
-                elite_idx = torch.argsort(returns)[-self.cem_elite:]
-                elites    = U[elite_idx]                          # (n_elite, H, act_dim)
-                u_mean    = elites.mean(dim=0)
-                u_std     = elites.std(dim=0).clamp(min=0.05)
-            else:
-                break
-
-        # Return first action of best sequence
-        best_idx = torch.argmax(returns)
-        return U[best_idx, 0]                                    # (act_dim,)
-
-    def _rollout_returns(self, x0: torch.Tensor,
-                          U: torch.Tensor) -> torch.Tensor:
-        """
-        Parallel rollout of M action sequences from x0.
-        Returns discounted returns including V(x_H) tail correction.
-
-        x0: (obs_dim,)
-        U:  (M, H, act_dim)
-        Returns: (M,)
-        """
-        M      = U.shape[0]
-        x      = x0.unsqueeze(0).expand(M, -1)    # (M, obs_dim)
-        G      = torch.zeros(M, device=self.device)
-        disc   = 1.0
-
-        for h in range(self.H):
-            u      = U[:, h, :]                    # (M, act_dim)
-            x_next = (
-                (self.A @ x.unsqueeze(-1)).squeeze(-1)
-                + (self.B @ u.unsqueeze(-1)).squeeze(-1)
-            )                                       # (M, obs_dim)
-
-            reward = self._reward_proxy(x, x_next)  # (M,)
-            G     += disc * reward
-            disc  *= self.gamma
-            x      = x_next
-
-        # Tail correction: V(x_H)
-        if self._steps >= self.warmup:
-            V_tail = self.value(x)                  # (M,)
-            G     += disc * V_tail
-
-        return G
-
-    def _reward_proxy(self, x: torch.Tensor,
-                       x_next: torch.Tensor) -> torch.Tensor:
-        """
-        Differentiable reward proxy used inside MPC rollout.
-        - Boundary: penalize states outside obs space
-        - Hull proximity: reward closeness to hull center/target
-        """
-        # Boundary check (soft)
-        margin  = torch.min(
-            x_next - self.obs_low,
-            self.obs_high - x_next
-        ).min(dim=-1).values
-        in_bounds = torch.sigmoid(margin * 10.0)  # ≈1 inside, ≈0 outside
-
-        if self.hull_center is not None:
-            dist   = torch.norm(x_next - self.hull_center, dim=-1)
-            reward = -0.1 * dist * in_bounds + (in_bounds - 0.5) * 10.0
-        else:
-            # Encourage spreading (maximizing hull volume) before hull known
-            spread = torch.norm(x_next - x, dim=-1)
-            reward = spread * in_bounds * 0.1
-
-        return reward
-
-    def push(self, obs, action, reward, next_obs, done):
-        self.buffer.push(obs, action, reward, next_obs, done)
-        self._steps += 1
+    name = "cem"
+
+    def __init__(self, env, population: int = 50, elite_frac: float = 0.2,
+                 n_eval_steps: int = 200, noise_init: float = 0.5,
+                 noise_floor: float = 0.01):
+        xDim = env.xDim; uDim = env.uDim
+        self.env    = env
+        self.pop    = population
+        self.elite  = max(2, int(population * elite_frac))
+        self.T      = n_eval_steps
+        self.dim    = uDim * (xDim + 1)   # K + b
+
+        self.mu  = np.zeros(self.dim,  np.float32)
+        self.std = np.full(self.dim, noise_init, np.float32)
+        self.floor = noise_floor
+        self._best_K = np.zeros((uDim, xDim), np.float32)
+        self._best_b = np.zeros(uDim,         np.float32)
+        self._xDim = xDim; self._uDim = uDim
+        self._act_low  = env.act_low
+        self._act_high = env.act_high
+        self._hull_module = None
+
+    def set_hull_module(self, m): self._hull_module = m
+
+    def _unpack(self, theta):
+        K = theta[:self._uDim*self._xDim].reshape(self._uDim, self._xDim)
+        b = theta[self._uDim*self._xDim:]
+        return K, b
+
+    def _eval(self, theta):
+        K, b = self._unpack(theta)
+        obs, _ = self.env.reset()
+        total  = 0.
+        for _ in range(self.T):
+            u   = np.clip(K @ obs + b, self._act_low, self._act_high)
+            obs, r, done, _, _ = self.env.step(u)
+            total += r
+            if done: break
+        return total
+
+    def select_action(self, obs, explore=True):
+        u = self._best_K @ obs + self._best_b
+        if explore:
+            u = u + np.random.randn(self._uDim).astype(np.float32) * 0.1
+        return np.clip(u, self._act_low, self._act_high)
+
+    def push(self, *args): pass   # CEM doesn't use a replay buffer
 
     def update(self) -> dict:
-        """Learn value function from replay buffer via TD(0)."""
-        if len(self.buffer) < self.batch_size or self._steps < self.warmup:
-            return {}
-        if self._steps % self.update_every != 0:
-            return {}
-
-        obs, acts, rews, next_obs, dones = self.buffer.sample(self.batch_size)
-
-        with torch.no_grad():
-            v_next  = self.value_target(next_obs).unsqueeze(-1)
-            v_target = rews + (1 - dones) * self.gamma * v_next
-
-        v_pred  = self.value(obs).unsqueeze(-1)
-        v_loss  = F.mse_loss(v_pred, v_target)
-
-        self.value_opt.zero_grad()
-        v_loss.backward()
-        nn.utils.clip_grad_norm_(self.value.parameters(), 1.0)
-        self.value_opt.step()
-        soft_update(self.value_target, self.value, tau=0.005)
-
-        self.metrics = {"value_loss": v_loss.item()}
-        return self.metrics
-
-    def set_hull_center(self, center: np.ndarray):
-        self.hull_center = torch.tensor(
-            center, dtype=torch.float32, device=self.device)
+        thetas  = (self.mu + np.random.randn(self.pop, self.dim).astype(np.float32)
+                   * self.std)
+        returns = np.array([self._eval(t) for t in thetas])
+        elite_i = np.argsort(returns)[-self.elite:]
+        elites  = thetas[elite_i]
+        self.mu  = elites.mean(0)
+        self.std = np.maximum(elites.std(0), self.floor)
+        self._best_K, self._best_b = self._unpack(self.mu)
+        return {"cem_return": float(returns[elite_i].mean()),
+                "cem_std":    float(self.std.mean())}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  UNIFIED TRAINING LOOP
-#  Works with all four agents via duck typing
+#  NEURAL NETWORK BUILDING BLOCKS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train(
-    env,
-    agent,
-    monitor               = None,
-    total_steps:    int   = 200_000,
-    hull_reward:    float = 100.0,
-    log_interval:   int   = 10,
-    eval_interval:  int   = 50,
-    device:         str   = "cpu",
-):
+if _TORCH:
+
+    def _mlp(dims: List[int], activation=nn.ReLU, output_activation=None) -> nn.Sequential:
+        layers = []
+        for i in range(len(dims)-1):
+            layers.append(nn.Linear(dims[i], dims[i+1]))
+            act = activation if i < len(dims)-2 else output_activation
+            if act: layers.append(act())
+        return nn.Sequential(*layers)
+
+    class _Critic(nn.Module):
+        def __init__(self, xDim, uDim, hidden=256):
+            super().__init__()
+            self.net = _mlp([xDim+uDim, hidden, hidden, 1])
+        def forward(self, s, a):
+            return self.net(torch.cat([s, a], -1)).squeeze(-1)
+
+    class _TwinCritic(nn.Module):
+        def __init__(self, xDim, uDim, hidden=256):
+            super().__init__()
+            self.q1 = _Critic(xDim, uDim, hidden)
+            self.q2 = _Critic(xDim, uDim, hidden)
+        def both(self, s, a): return self.q1(s,a), self.q2(s,a)
+        def min(self, s, a):  return torch.min(self.q1(s,a), self.q2(s,a))
+
+    class _DetActor(nn.Module):
+        """Deterministic actor for DDPG/TD3."""
+        def __init__(self, xDim, uDim, act_scale, act_bias, hidden=256):
+            super().__init__()
+            self.net  = _mlp([xDim, hidden, hidden, uDim], output_activation=nn.Tanh)
+            self.register_buffer("scale", torch.tensor(act_scale, dtype=torch.float32))
+            self.register_buffer("bias",  torch.tensor(act_bias,  dtype=torch.float32))
+        def forward(self, s): return self.net(s) * self.scale + self.bias
+
+    class _SACActorNet(nn.Module):
+        """Stochastic actor for SAC — outputs (mu, log_std)."""
+        LOG_STD_MIN = -5.; LOG_STD_MAX = 2.
+        def __init__(self, xDim, uDim, act_scale, act_bias, hidden=256):
+            super().__init__()
+            self.net     = _mlp([xDim, hidden, hidden])
+            self.mu_head = nn.Linear(hidden, uDim)
+            self.ls_head = nn.Linear(hidden, uDim)
+            self.register_buffer("scale", torch.tensor(act_scale, dtype=torch.float32))
+            self.register_buffer("bias",  torch.tensor(act_bias,  dtype=torch.float32))
+
+        def forward(self, s):
+            h   = F.relu(self.net(s))
+            mu  = self.mu_head(h)
+            ls  = self.ls_head(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+            return mu, ls
+
+        def sample(self, s):
+            mu, ls = self(s)
+            std    = ls.exp()
+            u      = mu + std * torch.randn_like(std)
+            # tanh squash + log-prob correction
+            log_pi = (-0.5*((u-mu)/std).pow(2) - ls
+                      - 0.5*np.log(2*np.pi)).sum(-1)
+            a      = torch.tanh(u)
+            log_pi = log_pi - torch.log(1 - a.pow(2) + 1e-6).sum(-1)
+            return a * self.scale + self.bias, log_pi
+
+        @torch.no_grad()
+        def act(self, s_np, explore=True):
+            s = torch.tensor(s_np, dtype=torch.float32).unsqueeze(0)
+            if explore:
+                a, _ = self.sample(s)
+            else:
+                mu, _ = self(s); a = torch.tanh(mu) * self.scale + self.bias
+            return a.squeeze(0).numpy()
+
+    # ── shared training helpers ───────────────────────────────────────────────
+
+    def _to_tensors(*arrays, device="cpu"):
+        return [torch.tensor(a, dtype=torch.float32).to(device) for a in arrays]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DDPG
+# ══════════════════════════════════════════════════════════════════════════════
+
+if _TORCH:
+
+    class DDPGAgent:
+        name = "ddpg"
+
+        def __init__(self, env, hidden=256, lr=3e-4, gamma=0.99, tau=0.005,
+                     batch=256, buffer_cap=100_000, expl_noise=0.1, device="cpu"):
+            xDim = env.xDim; uDim = env.uDim
+            scale = (env.act_high - env.act_low) / 2.
+            bias  = (env.act_high + env.act_low) / 2.
+            self._device = torch.device(device)
+            self._act_low  = env.act_low; self._act_high = env.act_high
+            self._gamma = gamma; self._tau = tau; self._batch = batch
+            self._noise = expl_noise
+            self._buf   = ReplayBuffer(buffer_cap, xDim, uDim)
+            self._hull_module = None
+
+            self._actor        = _DetActor(xDim, uDim, scale, bias, hidden).to(self._device)
+            self._actor_target = copy.deepcopy(self._actor)
+            self._critic       = _Critic(xDim, uDim, hidden).to(self._device)
+            self._critic_target= copy.deepcopy(self._critic)
+
+            self._opt_a = optim.Adam(self._actor.parameters(),  lr=lr)
+            self._opt_c = optim.Adam(self._critic.parameters(), lr=lr)
+
+        def set_hull_module(self, m): self._hull_module = m
+
+        def select_action(self, obs, explore=True):
+            with torch.no_grad():
+                s = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self._device)
+                a = self._actor(s).squeeze(0).cpu().numpy()
+            if explore:
+                a = a + np.random.randn(*a.shape).astype(np.float32) * self._noise
+            return np.clip(a, self._act_low, self._act_high)
+
+        def push(self, s, a, r, ns, done): self._buf.push(s, a, r, ns, done)
+
+        def update(self) -> dict:
+            if len(self._buf) < self._batch: return {}
+            s,a,r,ns,d = self._buf.sample(self._batch)
+            s,a,r_t,ns,d = _to_tensors(s,a,r,ns,d, device=self._device.type)
+
+            # Hull shaping
+            if self._hull_module:
+                r_t = r_t + self._hull_module.reward_shaping(s, scale=0.5)
+
+            with torch.no_grad():
+                na  = self._actor_target(ns)
+                qt  = r_t + self._gamma*(1-d)*self._critic_target(ns, na)
+            qv    = self._critic(s, a)
+            lc    = F.mse_loss(qv, qt)
+            self._opt_c.zero_grad(); lc.backward(); self._opt_c.step()
+
+            la    = -self._critic(s, self._actor(s)).mean()
+            self._opt_a.zero_grad(); la.backward(); self._opt_a.step()
+
+            for tp, p in zip(self._actor_target.parameters(), self._actor.parameters()):
+                tp.data.mul_(1-self._tau).add_(self._tau*p.data)
+            for tp, p in zip(self._critic_target.parameters(), self._critic.parameters()):
+                tp.data.mul_(1-self._tau).add_(self._tau*p.data)
+
+            return {"critic_loss": lc.item(), "actor_loss": la.item()}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TD3
+# ══════════════════════════════════════════════════════════════════════════════
+
+if _TORCH:
+
+    class TD3Agent:
+        name = "td3"
+
+        def __init__(self, env, hidden=256, lr=3e-4, gamma=0.99, tau=0.005,
+                     batch=256, buffer_cap=100_000, expl_noise=0.1,
+                     policy_noise=0.2, noise_clip=0.5, policy_delay=2,
+                     device="cpu"):
+            xDim = env.xDim; uDim = env.uDim
+            scale = (env.act_high - env.act_low) / 2.
+            bias  = (env.act_high + env.act_low) / 2.
+            self._device = torch.device(device)
+            self._act_low = env.act_low; self._act_high = env.act_high
+            self._gamma   = gamma; self._tau = tau; self._batch = batch
+            self._expl    = expl_noise; self._pnoise = policy_noise
+            self._nclip   = noise_clip; self._delay  = policy_delay
+            self._step    = 0
+            self._buf     = ReplayBuffer(buffer_cap, xDim, uDim)
+            self._hull_module = None
+
+            self._actor        = _DetActor(xDim, uDim, scale, bias, hidden).to(self._device)
+            self._actor_target = copy.deepcopy(self._actor)
+            self._critic       = _TwinCritic(xDim, uDim, hidden).to(self._device)
+            self._critic_target= copy.deepcopy(self._critic)
+
+            self._opt_a = optim.Adam(self._actor.parameters(),  lr=lr)
+            self._opt_c = optim.Adam(self._critic.parameters(), lr=lr)
+
+        def set_hull_module(self, m): self._hull_module = m
+
+        def select_action(self, obs, explore=True):
+            with torch.no_grad():
+                s = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self._device)
+                a = self._actor(s).squeeze(0).cpu().numpy()
+            if explore:
+                a = a + np.random.randn(*a.shape).astype(np.float32)*self._expl
+            return np.clip(a, self._act_low, self._act_high)
+
+        def push(self, s, a, r, ns, done): self._buf.push(s, a, r, ns, done)
+
+        def update(self) -> dict:
+            if len(self._buf) < self._batch: return {}
+            self._step += 1
+            s,a,r,ns,d = self._buf.sample(self._batch)
+            s,a,r_t,ns,d = _to_tensors(s,a,r,ns,d, device=self._device.type)
+
+            if self._hull_module:
+                r_t = r_t + self._hull_module.reward_shaping(s, scale=0.5)
+
+            with torch.no_grad():
+                noise = (torch.randn_like(a)*self._pnoise).clamp(-self._nclip, self._nclip)
+                na    = (self._actor_target(ns)+noise).clamp(
+                         torch.tensor(self._act_low, device=self._device),
+                         torch.tensor(self._act_high,device=self._device))
+                qt = r_t + self._gamma*(1-d)*self._critic_target.min(ns, na)
+
+            q1, q2 = self._critic.both(s, a)
+            lc = F.mse_loss(q1, qt) + F.mse_loss(q2, qt)
+            self._opt_c.zero_grad(); lc.backward(); self._opt_c.step()
+
+            la = None
+            if self._step % self._delay == 0:
+                la = -self._critic.q1(s, self._actor(s)).mean()
+                self._opt_a.zero_grad(); la.backward(); self._opt_a.step()
+                for tp,p in zip(self._actor_target.parameters(), self._actor.parameters()):
+                    tp.data.mul_(1-self._tau).add_(self._tau*p.data)
+                for tp,p in zip(self._critic_target.parameters(), self._critic.parameters()):
+                    tp.data.mul_(1-self._tau).add_(self._tau*p.data)
+
+            return {"critic_loss": lc.item(),
+                    "actor_loss":  la.item() if la else float("nan")}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SAC
+# ══════════════════════════════════════════════════════════════════════════════
+
+if _TORCH:
+
+    class SACAgent:
+        name = "sac"
+
+        def __init__(self, env, hidden=256, lr=3e-4, gamma=0.99, tau=0.005,
+                     alpha=0.2, auto_alpha=True, batch=256,
+                     buffer_cap=100_000, device="cpu"):
+            xDim = env.xDim; uDim = env.uDim
+            scale = (env.act_high - env.act_low) / 2.
+            bias  = (env.act_high + env.act_low) / 2.
+            self._device = torch.device(device)
+            self._act_low = env.act_low; self._act_high = env.act_high
+            self._gamma = gamma; self._tau = tau; self._batch = batch
+            self._buf   = ReplayBuffer(buffer_cap, xDim, uDim)
+            self._hull_module = None
+
+            self._actor  = _SACActorNet(xDim, uDim, scale, bias, hidden).to(self._device)
+            self._critic = _TwinCritic(xDim, uDim, hidden).to(self._device)
+            self._critic_target = copy.deepcopy(self._critic)
+            self._opt_a  = optim.Adam(self._actor.parameters(),  lr=lr)
+            self._opt_c  = optim.Adam(self._critic.parameters(), lr=lr)
+
+            self._auto_alpha = auto_alpha
+            if auto_alpha:
+                self._log_alpha   = torch.zeros(1, requires_grad=True,
+                                                 device=self._device)
+                self._target_ent  = -float(uDim)
+                self._opt_alpha   = optim.Adam([self._log_alpha], lr=lr)
+                self._alpha       = self._log_alpha.exp().item()
+            else:
+                self._alpha = alpha
+
+        def set_hull_module(self, m): self._hull_module = m
+
+        @property
+        def alpha(self): return self._alpha
+
+        def select_action(self, obs, explore=True):
+            return self._actor.act(obs.astype(np.float32), explore)
+
+        def push(self, s, a, r, ns, done): self._buf.push(s, a, r, ns, done)
+
+        def update(self) -> dict:
+            if len(self._buf) < self._batch: return {}
+            s,a,r,ns,d = self._buf.sample(self._batch)
+            s,a,r_t,ns,d = _to_tensors(s,a,r,ns,d, device=self._device.type)
+
+            if self._hull_module:
+                r_t = r_t + self._hull_module.reward_shaping(s, scale=0.5)
+
+            # Critic
+            with torch.no_grad():
+                na, lp = self._actor.sample(ns)
+                qt     = r_t + self._gamma*(1-d)*(
+                             self._critic_target.min(ns,na) - self._alpha*lp)
+            q1,q2 = self._critic.both(s,a)
+            lc    = F.mse_loss(q1,qt)+F.mse_loss(q2,qt)
+            self._opt_c.zero_grad(); lc.backward(); self._opt_c.step()
+
+            # Actor
+            a_new, lp_new = self._actor.sample(s)
+            qmin          = self._critic.min(s, a_new)
+            la            = (self._alpha*lp_new - qmin).mean()
+            self._opt_a.zero_grad(); la.backward(); self._opt_a.step()
+
+            # Alpha
+            l_alpha = None
+            if self._auto_alpha:
+                l_alpha = -(self._log_alpha*(lp_new+self._target_ent).detach()).mean()
+                self._opt_alpha.zero_grad(); l_alpha.backward()
+                self._opt_alpha.step()
+                self._alpha = self._log_alpha.exp().item()
+
+            for tp,p in zip(self._critic_target.parameters(), self._critic.parameters()):
+                tp.data.mul_(1-self._tau).add_(self._tau*p.data)
+
+            return {"critic_loss": lc.item(), "actor_loss": la.item(),
+                    "alpha": self._alpha,
+                    "alpha_loss": l_alpha.item() if l_alpha else float("nan")}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODEL-BASED AGENT  (linear model identification + MPC)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModelBasedAgent:
     """
-    Unified training loop compatible with:
-      ModelBasedRL, SACAgent, MPCRLAgent  → step-by-step interaction
-      CEMAgent, NESAgent                  → handled separately (population-based)
+    Identifies the linear model x_{t+1} = Â x_t + B̂ u_t online via least-squares,
+    then plans with finite-horizon MPC minimising Σ‖x‖² subject to action bounds.
+
+    No neural network — pure numpy. Fast and sample-efficient for truly linear systems.
+    Works poorly when the env has significant noise or nonlinearity.
     """
-    is_population = isinstance(agent, (CEMAgent, NESAgent))
-    if is_population:
-        return _train_population(env, agent, monitor, total_steps,
-                                  hull_reward, log_interval)
+    name = "model_based"
 
-    obs, _    = env.reset()
-    ep_states  = [obs.copy()]
-    ep_actions = []
-    ep_rewards = []
-    ep_count   = 0
-    step       = 0
+    def __init__(self, env, horizon: int = 20, n_rand_steps: int = 200,
+                 reg: float = 1e-4):
+        self.env       = env
+        self.xDim      = env.xDim; self.uDim = env.uDim
+        self.horizon   = horizon
+        self.reg       = reg
+        self._act_low  = env.act_low; self._act_high = env.act_high
+        self._hull_module = None
 
-    print(f"\nTraining {type(agent).__name__} | total_steps={total_steps}")
-    print(f"{'Step':>10} | {'Episode':>8} | {'Return':>10} | {'Hull':>6} | Info")
-    print("─" * 65)
+        # Data for system identification
+        self._X:  List[np.ndarray] = []   # states x_t
+        self._U:  List[np.ndarray] = []   # actions u_t
+        self._Xn: List[np.ndarray] = []   # next states x_{t+1}
+        self._n_rand = n_rand_steps
+        self._steps  = 0
 
-    while step < total_steps:
-        action = agent.select_action(obs)
-        next_obs, reward, term, trunc, info = env.step(action)
-        done = term or trunc
+        # Model estimate
+        self._A_hat = np.eye(self.xDim, dtype=np.float32)
+        self._B_hat = np.zeros((self.xDim, self.uDim), np.float32)
+        self._model_ready = False
 
-        ep_states.append(next_obs.copy())
-        ep_actions.append(action.copy())
-        ep_rewards.append(reward)
+    def set_hull_module(self, m): self._hull_module = m
 
-        # Push transition (SAC and MPC-RL)
-        if hasattr(agent, "push"):
-            agent.push(obs, action, reward, next_obs, float(done))
+    def _fit_model(self):
+        """Least-squares identification: [A|B] from (X, U) → Xn."""
+        if len(self._X) < self.xDim + self.uDim + 2:
+            return
+        X  = np.array(self._X,  np.float32)   # (N, xDim)
+        U  = np.array(self._U,  np.float32)   # (N, uDim)
+        Xn = np.array(self._Xn, np.float32)   # (N, xDim)
+        Z  = np.concatenate([X, U], 1)         # (N, xDim+uDim)
+        # min ‖Z θ - Xn‖²_F  →  θ = (Z^T Z + λI)^{-1} Z^T Xn
+        reg = self.reg * np.eye(Z.shape[1], dtype=np.float32)
+        try:
+            theta = np.linalg.solve(Z.T@Z + reg, Z.T@Xn)   # (xDim+uDim, xDim)
+        except np.linalg.LinAlgError:
+            return
+        self._A_hat = theta[:self.xDim].T
+        self._B_hat = theta[self.xDim:].T
+        self._model_ready = True
 
-        obs   = next_obs
-        step += 1
+    def _mpc(self, obs: np.ndarray) -> np.ndarray:
+        """Finite-horizon MPC: minimise Σ‖x_t‖² via gradient descent on actions."""
+        A, B = self._A_hat, self._B_hat
+        T    = self.horizon
+        # Initialise action sequence at zero
+        Us   = np.zeros((T, self.uDim), np.float32)
+        lr   = 0.05
+        for _ in range(30):
+            # Forward rollout
+            xs = [obs.copy()]
+            for t in range(T):
+                xs.append(A @ xs[-1] + B @ Us[t])
+            xs = np.array(xs)   # (T+1, xDim)
+            # Gradient dJ/dU_t = B^T (2 Σ_{s≥t} dJ/dx_s)
+            dJ_dx = 2. * xs[1:]   # (T, xDim)
+            for t in range(T-1, 0, -1):
+                dJ_dx[t-1] += A.T @ dJ_dx[t]
+            dJ_dU = dJ_dx @ B    # (T, uDim)
+            Us    = np.clip(Us - lr*dJ_dU, self._act_low, self._act_high)
+        return Us[0]
 
-        # Step-level updates (SAC, MPC-RL)
-        if hasattr(agent, "update"):
-            metrics = agent.update()
+    def select_action(self, obs, explore=True):
+        if not self._model_ready or self._steps < self._n_rand:
+            u = np.random.uniform(self._act_low, self._act_high).astype(np.float32)
+        else:
+            u = self._mpc(obs)
+        if explore:
+            u = u + np.random.randn(self.uDim).astype(np.float32)*0.05
+        return np.clip(u, self._act_low, self._act_high)
 
-        if done:
-            ep_count += 1
-            record = EpisodeRecord(
-                states  = np.array(ep_states,  dtype=np.float32),
-                actions = np.array(ep_actions, dtype=np.float32),
-                rewards = np.array(ep_rewards, dtype=np.float32),
-                ep_id   = ep_count,
-            )
+    def push(self, s, a, r, ns, done):
+        self._X.append(s); self._U.append(a); self._Xn.append(ns)
+        self._steps += 1
+        if self._steps % 50 == 0:
+            self._fit_model()
 
-            # Post-episode hull processing
-            hull_hit = False
-            if monitor is not None:
-                result = monitor.process(record)
-                hull_hit = result.hull_reached
-
-                # SAC: relabel buffer
-                if hasattr(agent, "buffer") and hasattr(agent.buffer, "relabel_last_episode"):
-                    agent.buffer.relabel_last_episode(result, hull_reward)
-
-                # Model-based / MPC: update hull center
-                if result.hull_reached and monitor.target is not None:
-                    center = monitor.target.mean(axis=0)
-                    if hasattr(agent, "set_hull_center"):
-                        agent.set_hull_center(center)
-
-            # Model-based: update from episode starting states
-            if isinstance(agent, ModelBasedRL) and len(ep_states) > 1:
-                start_states = np.array(ep_states[:-1], dtype=np.float32)
-                if len(start_states) > 0:
-                    batch = start_states[
-                        np.random.choice(len(start_states),
-                                         min(32, len(start_states)), replace=False)]
-                    agent.update(batch)
-
-            ep_ret = sum(ep_rewards)
-            if ep_count % log_interval == 0:
-                m_str = " | ".join(f"{k}={v:.3f}"
-                                   for k, v in (agent.metrics.items()
-                                                if hasattr(agent, "metrics") else {}).items()
-                                   if not k.endswith("_loss"))
-                print(f"{step:>10} | {ep_count:>8} | {ep_ret:>10.2f} | "
-                      f"{'✓' if hull_hit else '✗':>6} | {m_str}")
-
-            # Reset
-            obs, _     = env.reset()
-            ep_states  = [obs.copy()]
-            ep_actions = []
-            ep_rewards = []
-
-    return agent
-
-
-def _train_population(env, agent, monitor, total_steps,
-                       hull_reward, log_interval):
-    """Training loop for population-based methods (CEM, NES)."""
-    import functools
-    env_factory = lambda: type(env)(
-        env.A, env.B,
-        (env.observation_space.low, env.observation_space.high),
-        (env.action_space.low,      env.action_space.high),
-    )
-    total_evals = 0
-    gen         = 0
-
-    print(f"\nTraining {type(agent).__name__} | total_steps={total_steps}")
-    print(f"{'Evals':>8} | {'Gen':>5} | {'Best':>10} | {'Mean':>10} | Info")
-    print("─" * 55)
-
-    while total_evals < total_steps:
-        metrics, ep_records = agent.evolve(
-            env_factory, hull_reward=hull_reward, monitor=monitor)
-        total_evals += agent.N * agent.n_eval
-        gen         += 1
-
-        if gen % log_interval == 0:
-            m_str = " | ".join(f"{k}={v:.3f}"
-                                for k, v in metrics.items()
-                                if k in ("best_score", "mean_score"))
-            print(f"{total_evals:>8} | {gen:>5} | {m_str}")
-
-    return agent
+    def update(self) -> dict:
+        if self._model_ready:
+            A_err = float(np.linalg.norm(self._A_hat))
+            return {"A_hat_norm": A_err, "model_ready": 1.}
+        return {"model_ready": 0.}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ALGORITHM COMPARISON RUNNER
+#  SAC × CEM  (CEM explores, SAC exploits)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compare_algorithms(env_factory, monitor_factory,
-                        total_steps=100_000, seed=42, device="cpu"):
-    """
-    Run all four algorithms on the same env and print a comparison table.
-    """
-    import time
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+if _TORCH:
 
-    env   = env_factory()
-    obs_s = env.observation_space
-    act_s = env.action_space
-    A, B  = env.A, env.B
+    class SACxCEMAgent:
+        """
+        Two-phase hybrid:
+          • When hull not yet identified: CEM explores (gradient-free, diverse)
+          • When hull identified:        SAC exploits (gradient-based, fine-grained)
 
-    agents = {
-        "ModelBased": ModelBasedRL(A, B, obs_s, act_s, device=device),
-        "SAC":        SACAgent(obs_s, act_s, device=device),
-        "MPC-RL":     MPCRLAgent(A, B, obs_s, act_s, device=device),
-        "CEM":        CEMAgent(obs_s, act_s),
-    }
+        Transition triggered by is_hull_valid flag (set by the training loop
+        after the monitor confirms a valid target).
 
-    results = {}
-    for name, agent in agents.items():
-        print(f"\n{'='*50}\n  {name}\n{'='*50}")
-        t0      = time.time()
-        monitor = monitor_factory()
-        trained = train(env_factory(), agent, monitor,
-                         total_steps=total_steps, log_interval=20)
-        dt      = time.time() - t0
-        results[name] = {
-            "wall_time":   dt,
-            "hull_valid":  monitor.is_valid_target,
-            "hull_points": len(monitor.target) if monitor.target is not None else 0,
-        }
+        Both share a replay buffer so SAC can learn from CEM's exploration data.
+        """
+        name = "sac_x_cem"
 
-    print(f"\n{'='*60}")
-    print(f"  {'Algorithm':<12} | {'Time (s)':>9} | {'Hull Valid':>10} | {'Hull Points':>11}")
-    print(f"  {'-'*55}")
-    for name, r in results.items():
-        print(f"  {name:<12} | {r['wall_time']:>9.1f} | "
-              f"{str(r['hull_valid']):>10} | {r['hull_points']:>11}")
-    return results
+        def __init__(self, env, **kwargs):
+            self._sac = SACAgent(env, **{k:v for k,v in kwargs.items()
+                                          if k not in ("population","elite_frac",
+                                                        "n_eval_steps","noise_init")})
+            self._cem = CEMAgent(env, **{k:v for k,v in kwargs.items()
+                                          if k in ("population","elite_frac",
+                                                    "n_eval_steps","noise_init")})
+            self._use_sac = False
+
+        def set_hull_valid(self, valid: bool): self._use_sac = valid
+        def set_hull_module(self, m):
+            self._sac.set_hull_module(m)
+            self._cem.set_hull_module(m)
+
+        def select_action(self, obs, explore=True):
+            if self._use_sac:
+                return self._sac.select_action(obs, explore)
+            return self._cem.select_action(obs, explore)
+
+        def push(self, s, a, r, ns, done):
+            self._sac.push(s, a, r, ns, done)   # SAC buffer always fed
+
+        def update(self) -> dict:
+            metrics = {}
+            if self._use_sac:
+                metrics.update(self._sac.update())
+            else:
+                metrics.update(self._cem.update())
+            return metrics
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DEMO
+#  FACTORY
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    A = np.array([[0.9, 0.1], [0.0, 0.9]], dtype=np.float32)
-    B = np.array([[0.1, 0.0], [0.0, 0.1]], dtype=np.float32)
-    state_bounds  = ([-5., -5.], [5., 5.])
-    action_bounds = ([-1., -1.], [1., 1.])
-
-    print("Testing individual algorithm construction...")
-
-    class DummySpace:
-        def __init__(self, low, high):
-            self.low   = np.array(low,  dtype=np.float32)
-            self.high  = np.array(high, dtype=np.float32)
-            self.shape = self.low.shape
-
-    obs_s = DummySpace(state_bounds[0],  state_bounds[1])
-    act_s = DummySpace(action_bounds[0], action_bounds[1])
-
-    mb  = ModelBasedRL(A, B, obs_s, act_s)
-    sac = SACAgent(obs_s, act_s)
-    cem = CEMAgent(obs_s, act_s)
-    nes = NESAgent(obs_s, act_s)
-    mpc = MPCRLAgent(A, B, obs_s, act_s)
-
-    # Quick action selection test
-    obs = np.random.randn(2).astype(np.float32)
-    print(f"  ModelBased action: {mb.select_action(obs)}")
-    print(f"  SAC action:        {sac.select_action(obs)}")
-    print(f"  CEM action:        {cem.select_action(obs)}")
-    print(f"  NES action:        {nes.select_action(obs)}")
-    print(f"  MPC-RL action:     {mpc.select_action(obs)}")
-
-    n_mb  = sum(p.numel() for p in mb.policy.parameters())
-    n_sac = sum(p.numel() for p in list(sac.actor.parameters())
-                             + list(sac.critic.parameters()))
-    n_mpc = sum(p.numel() for p in mpc.value.parameters())
-
-    print(f"\nParameter counts:")
-    print(f"  ModelBased policy:  {n_mb:,}")
-    print(f"  SAC actor+critic:   {n_sac:,}")
-    print(f"  CEM policy params:  {cem.param_dim}")
-    print(f"  NES policy params:  {nes.param_dim}")
-    print(f"  MPC value net:      {n_mpc:,}")
-    print("\nAll agents constructed successfully.")
+def make_agent(name: str, env, **kwargs):
+    """Used by benchmark.py. Returns an initialised agent."""
+    registry = {"random": RandomAgent, "cem": CEMAgent,
+                "model_based": ModelBasedAgent}
+    if _TORCH:
+        registry.update({"ddpg": DDPGAgent, "td3": TD3Agent,
+                         "sac": SACAgent, "sac_x_cem": SACxCEMAgent})
+    if name not in registry:
+        raise ValueError(f"Unknown agent '{name}'. Available: {list(registry)}")
+    return registry[name](env, **kwargs)
